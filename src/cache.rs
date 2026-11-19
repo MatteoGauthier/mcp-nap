@@ -12,8 +12,9 @@ pub struct Cache {
 }
 
 impl Cache {
-    pub fn open(dir: &Path, command: &[String]) -> Cache {
-        let path = dir.join(format!("{:016x}.json", command_hash(command)));
+    /// Opens the cache of `command`, kept apart per `working_dir` when one is given.
+    pub fn open(dir: &Path, command: &[String], working_dir: Option<&Path>) -> Cache {
+        let path = dir.join(format!("{:016x}.json", key_hash(command, working_dir)));
         let entries = fs::read(&path)
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -72,16 +73,19 @@ pub fn default_dir() -> PathBuf {
     }
 }
 
-/// FNV-1a over the command parts, stable across Rust versions unlike `DefaultHasher`.
-fn command_hash(command: &[String]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for part in command {
-        for byte in part.bytes().chain([0]) {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-    hash
+/// FNV-1a over the command parts and the working folder, stable across Rust versions unlike `DefaultHasher`.
+fn key_hash(command: &[String], working_dir: Option<&Path>) -> u64 {
+    // each part ends with 0, and the folder starts with 1, so no argument list can collide with a folder
+    let parts = command.iter().flat_map(|part| part.bytes().chain([0]));
+    let folder = working_dir.into_iter().flat_map(|dir| {
+        [1].into_iter()
+            .chain(dir.as_os_str().as_encoded_bytes().iter().copied())
+    });
+    parts
+        .chain(folder)
+        .fold(0xcbf2_9ce4_8422_2325, |hash: u64, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
 }
 
 #[cfg(test)]
@@ -98,16 +102,20 @@ mod tests {
         let dir = env::temp_dir().join(format!("mcp-nap-cache-{}", std::process::id()));
         let server = command(&["server", "--flag"]);
 
-        let mut cache = Cache::open(&dir, &server);
+        let mut cache = Cache::open(&dir, &server, None);
         cache.set("tools/list", json!({ "tools": [] }));
         cache.set("prompts/list", json!({ "prompts": [] }));
         cache.remove("prompts/list");
 
-        let reopened = Cache::open(&dir, &server);
+        let reopened = Cache::open(&dir, &server, None);
         assert_eq!(reopened.get("tools/list"), Some(&json!({ "tools": [] })));
         assert_eq!(reopened.get("prompts/list"), None);
         assert_eq!(
-            Cache::open(&dir, &command(&["other"])).get("tools/list"),
+            Cache::open(&dir, &command(&["other"]), None).get("tools/list"),
+            None
+        );
+        assert_eq!(
+            Cache::open(&dir, &server, Some(Path::new("/project"))).get("tools/list"),
             None
         );
 
@@ -115,14 +123,23 @@ mod tests {
     }
 
     #[test]
-    fn hash_separates_arguments() {
+    fn hash_separates_arguments_and_folders() {
+        let project = Some(Path::new("/project"));
         assert_ne!(
-            command_hash(&command(&["ab", "c"])),
-            command_hash(&command(&["a", "bc"]))
+            key_hash(&command(&["ab", "c"]), None),
+            key_hash(&command(&["a", "bc"]), None)
+        );
+        assert_ne!(
+            key_hash(&command(&["server"]), None),
+            key_hash(&command(&["server"]), project)
+        );
+        assert_ne!(
+            key_hash(&command(&["server"]), project),
+            key_hash(&command(&["server"]), Some(Path::new("/other")))
         );
         assert_eq!(
-            command_hash(&command(&["server"])),
-            command_hash(&command(&["server"]))
+            key_hash(&command(&["server"]), project),
+            key_hash(&command(&["server"]), project)
         );
     }
 }

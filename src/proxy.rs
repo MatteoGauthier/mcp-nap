@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -14,6 +15,8 @@ pub struct Config {
     pub command: Vec<String>,
     pub idle: Duration,
     pub cache_dir: PathBuf,
+    /// keep a separate cache per working folder
+    pub per_dir: bool,
 }
 
 pub enum Event {
@@ -87,8 +90,9 @@ struct Proxy {
 
 impl Proxy {
     fn new(config: Config, events: Sender<Event>) -> Proxy {
+        let working_dir = config.per_dir.then(env::current_dir).and_then(Result::ok);
         Proxy {
-            cache: Cache::open(&config.cache_dir, &config.command),
+            cache: Cache::open(&config.cache_dir, &config.command, working_dir.as_deref()),
             command: config.command,
             idle: config.idle,
             events,

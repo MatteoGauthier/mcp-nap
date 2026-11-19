@@ -75,6 +75,7 @@ If an app does not find `mcp-nap`, use the full path, for example `/Users/you/.c
 
 - `--idle <seconds>`: idle time before the server is stopped, `0` keeps it running. Default `600`.
 - `--cache-dir <dir>`: where responses are cached. Default `~/Library/Caches/mcp-nap` on macOS, `~/.cache/mcp-nap` on Linux, or `$XDG_CACHE_HOME/mcp-nap`.
+- `--per-dir`: keep a separate cache per working folder, for servers whose tools, prompts or resources depend on the project they run in. Off by default, so a new folder reuses the cache of the same command.
 
 Options end at the first argument without a dash, like with `timeout` or `env`, so the server's own flags pass through untouched. Write `--` before the command only if it starts with a dash.
 
@@ -88,7 +89,7 @@ Options end at the first argument without a dash, like with `timeout` or `env`, 
 
 ## Limits
 
-- The cache is keyed by the command and its arguments, not by environment variables or the working directory.
+- The cache is keyed by the command and its arguments, plus the working folder with `--per-dir`, not by environment variables.
 - State kept inside the server, such as a selected browser tab, starts over after it sleeps.
 - A resource subscription keeps the server awake for the rest of the session.
 

@@ -10,13 +10,14 @@ use std::time::Duration;
 use proxy::Config;
 
 const USAGE: &str = "\
-usage: mcp-nap [--idle <seconds>] [--cache-dir <dir>] <command> [args...]
+usage: mcp-nap [--idle <seconds>] [--cache-dir <dir>] [--per-dir] <command> [args...]
 
 Starts <command> on the first tool call and stops it after <seconds> idle.
 
 options:
   --idle <seconds>   idle time before the server is stopped, 0 = never (default 600)
   --cache-dir <dir>  where handshake and list responses are cached
+  --per-dir          keep a separate cache per working folder
   -h, --help         print this help
   -V, --version      print the version";
 
@@ -50,6 +51,7 @@ fn main() -> ExitCode {
 fn parse_args(args: Vec<String>) -> Result<Command, String> {
     let mut idle = Duration::from_secs(600);
     let mut cache_dir = None;
+    let mut per_dir = false;
     let mut args = args.into_iter().peekable();
     // like `timeout` or `env`: options end at the first argument without a dash, or at `--`
     while let Some(arg) = args.next_if(|arg| arg.starts_with('-')) {
@@ -67,6 +69,7 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
                     args.next().ok_or("--cache-dir needs a value")?,
                 ));
             }
+            "--per-dir" => per_dir = true,
             "-h" | "--help" => return Ok(Command::Help),
             "-V" | "--version" => return Ok(Command::Version),
             other => return Err(format!("unknown option: {other}")),
@@ -80,6 +83,7 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         command,
         idle,
         cache_dir: cache_dir.unwrap_or_else(cache::default_dir),
+        per_dir,
     }))
 }
 
@@ -122,8 +126,16 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_ten_idle_minutes() {
-        assert_eq!(run(&["server"]).idle, Duration::from_secs(600));
+    fn defaults_to_ten_idle_minutes_and_one_cache_per_command() {
+        let config = run(&["server"]);
+        assert_eq!(config.idle, Duration::from_secs(600));
+        assert!(!config.per_dir);
+    }
+
+    #[test]
+    fn per_dir_turns_on_a_cache_per_working_folder() {
+        assert!(run(&["--per-dir", "server"]).per_dir);
+        assert!(!run(&["server", "--per-dir"]).per_dir);
     }
 
     #[test]

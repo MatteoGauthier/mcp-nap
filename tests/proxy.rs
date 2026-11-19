@@ -315,6 +315,28 @@ fn changed_prompts_are_announced_after_a_start() {
 }
 
 #[test]
+fn per_dir_keeps_one_cache_per_working_folder() {
+    let sandbox = Sandbox::new("per-dir");
+    let (first, second) = (sandbox.dir.join("first"), sandbox.dir.join("second"));
+    fs::create_dir_all(&first).unwrap();
+    fs::create_dir_all(&second).unwrap();
+    let handshake_in = |dir: &Path| {
+        let mut session = sandbox.launch(&["--per-dir"], &fake_server(), &[], dir);
+        session.handshake();
+        session.close();
+        sandbox.started_pids().len()
+    };
+
+    assert_eq!(handshake_in(&first), 1, "the first folder fills its cache");
+    assert_eq!(handshake_in(&first), 1, "the first folder is cached");
+    assert_eq!(
+        handshake_in(&second),
+        2,
+        "the second folder has its own cache"
+    );
+}
+
+#[test]
 fn a_crashing_server_fails_the_request_and_restarts_on_the_next_call() {
     let sandbox = Sandbox::new("crash");
     sandbox.fill_cache("echo,crash");
