@@ -24,16 +24,24 @@ impl Sandbox {
     }
 
     fn session(&self, idle: u64, tools: &str) -> Session {
-        self.session_for(idle, tools, &fake_server())
+        self.launch(
+            &["--idle", &idle.to_string()],
+            &fake_server(),
+            &[("FAKE_SERVER_TOOLS", tools)],
+            &self.dir,
+        )
     }
 
-    fn session_for(&self, idle: u64, tools: &str, server: &Path) -> Session {
+    /// Starts mcp-nap with extra `options` in front of `server`, from the working folder `cwd`.
+    fn launch(&self, options: &[&str], server: &Path, env: &[(&str, &str)], cwd: &Path) -> Session {
         let mut child = Command::new(env!("CARGO_BIN_EXE_mcp-nap"))
-            .args(["--idle", &idle.to_string(), "--cache-dir"])
+            .arg("--cache-dir")
             .arg(self.dir.join("cache"))
+            .args(options)
             .arg(server)
+            .current_dir(cwd)
             .env("FAKE_SERVER_LOG", self.dir.join("server.log"))
-            .env("FAKE_SERVER_TOOLS", tools)
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -289,7 +297,7 @@ fn a_crashing_server_fails_the_request_and_restarts_on_the_next_call() {
 #[test]
 fn a_missing_server_fails_the_handshake() {
     let sandbox = Sandbox::new("missing");
-    let mut session = sandbox.session_for(600, "echo", Path::new("/nonexistent/mcp-server"));
+    let mut session = sandbox.launch(&[], Path::new("/nonexistent/mcp-server"), &[], &sandbox.dir);
 
     assert_eq!(session.handshake()["error"]["code"], -32603);
     session.close();
