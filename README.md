@@ -34,14 +34,18 @@ This puts `mcp-nap` in `~/.cargo/bin`. It needs Rust 1.88 or later, and runs on 
 
 Write `mcp-nap` before the command of a stdio server.
 
-Claude Code:
+<details>
+<summary>Claude Code</summary>
 
 ```sh
 claude mcp add-json chrome-devtools -s user \
   '{"type":"stdio","command":"mcp-nap","args":["chrome-devtools-mcp","--browser-url=http://127.0.0.1:9222"]}'
 ```
 
-Codex (`~/.codex/config.toml`):
+</details>
+
+<details>
+<summary>Codex <code>~/.codex/config.toml</code></summary>
 
 ```toml
 [mcp_servers.chrome-devtools]
@@ -49,7 +53,10 @@ command = "mcp-nap"
 args = ["chrome-devtools-mcp", "--browser-url=http://127.0.0.1:9222"]
 ```
 
-Cursor (`~/.cursor/mcp.json`):
+</details>
+
+<details>
+<summary>Cursor <code>~/.cursor/mcp.json</code></summary>
 
 ```json
 {
@@ -62,7 +69,10 @@ Cursor (`~/.cursor/mcp.json`):
 }
 ```
 
-opencode (`~/.config/opencode/opencode.json`):
+</details>
+
+<details>
+<summary>opencode <code>~/.config/opencode/opencode.json</code></summary>
 
 ```json
 {
@@ -74,6 +84,8 @@ opencode (`~/.config/opencode/opencode.json`):
   }
 }
 ```
+
+</details>
 
 If an app does not find `mcp-nap`, use the full path, for example `/Users/you/.cargo/bin/mcp-nap`. Environment variables set on the server entry reach the real server unchanged.
 
