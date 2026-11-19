@@ -2,7 +2,7 @@
 
 Keeps stdio MCP servers asleep until a tool is called.
 
-Claude Code, Codex, Cursor and opencode start every local MCP server when a session starts and keep it running until the session ends, even if no tool is ever called. With a few sessions open, that is a few copies of every server. Put `mcp-nap` in front of a server command and the server only runs while it is used.
+Coding agent like Claude Code starts every local MCP server when a session starts and keep it running until the session ends, even if no tool is ever called. With a few sessions open, that is a few copies of every server, which wastes memory and CPU. Put `mcp-nap` in front of a server command and the server only runs while it is used.
 
 Chrome DevTools MCP on an Apple Silicon Mac:
 
