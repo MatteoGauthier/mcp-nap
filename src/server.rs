@@ -1,66 +1,77 @@
-use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::Sender;
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::io;
+use std::process::Stdio;
+use std::time::Duration;
 
-use crate::proxy::Event;
+use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop, ProcessGroup};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::ChildStdin;
+use tokio::signal::unix::SignalKind;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::time::timeout;
 
-/// How long a stopped server gets to exit before its process group is killed.
-const GRACE: Duration = Duration::from_secs(2);
+/// A line or the end of output from one server, tagged with the generation it was started as.
+pub enum Output {
+    Line(u64, String),
+    Closed(u64),
+}
 
-/// The real MCP server, running in its own process group.
+/// The real MCP server, leader of its own process group.
 pub struct Server {
-    child: Child,
-    stdin: ChildStdin,
+    child: Box<dyn ChildWrapper>,
+    stdin: Option<ChildStdin>,
 }
 
 impl Server {
-    pub fn spawn(command: &[String], generation: u64, events: Sender<Event>) -> io::Result<Server> {
-        let mut child = Command::new(&command[0])
-            .args(&command[1..])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .process_group(0)
-            .spawn()?;
-        let stdin = child.stdin.take().expect("stdin is piped");
-        let stdout = child.stdout.take().expect("stdout is piped");
-        thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                if events.send(Event::Server(generation, line)).is_err() {
+    pub fn spawn(
+        command: &[String],
+        generation: u64,
+        output: UnboundedSender<Output>,
+    ) -> io::Result<Server> {
+        let mut wrap = CommandWrap::with_new(&command[0], |child| {
+            child
+                .args(&command[1..])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit());
+        });
+        wrap.wrap(ProcessGroup::leader()).wrap(KillOnDrop);
+        let mut child = wrap.spawn()?;
+        let stdin = child.stdin().take();
+        let stdout = child.stdout().take().expect("stdout is piped");
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if output.send(Output::Line(generation, line)).is_err() {
                     return;
                 }
             }
-            let _ = events.send(Event::ServerClosed(generation));
+            let _ = output.send(Output::Closed(generation));
         });
         Ok(Server { child, stdin })
     }
 
-    pub fn send(&mut self, line: &str) -> io::Result<()> {
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()
+    pub async fn send(&mut self, line: &str) -> io::Result<()> {
+        let stdin = self.stdin.as_mut().ok_or(io::ErrorKind::BrokenPipe)?;
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await
     }
 
-    /// Stops the whole process group, so launchers like `npx` take their children with them.
-    pub fn stop(self) -> JoinHandle<()> {
-        let Server { mut child, stdin } = self;
-        drop(stdin);
-        let group = -(child.id() as libc::pid_t);
-        unsafe { libc::kill(group, libc::SIGTERM) };
-        thread::spawn(move || {
-            let deadline = Instant::now() + GRACE;
-            while Instant::now() < deadline {
-                if let Ok(Some(_)) = child.try_wait() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-            unsafe { libc::kill(group, libc::SIGKILL) };
-            let _ = child.wait();
-        })
+    /// The stdio shutdown of the MCP spec: close stdin, then SIGTERM, then SIGKILL, waiting `grace` between each.
+    pub async fn stop(mut self, grace: Duration) {
+        drop(self.stdin.take());
+        if self.exited_within(grace).await {
+            return;
+        }
+        let _ = self.child.signal(SignalKind::terminate().as_raw_value());
+        if self.exited_within(grace).await {
+            return;
+        }
+        let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
+    }
+
+    async fn exited_within(&mut self, grace: Duration) -> bool {
+        timeout(grace, self.child.wait()).await.is_ok()
     }
 }
