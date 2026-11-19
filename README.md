@@ -16,13 +16,19 @@ Chrome DevTools MCP on an Apple Silicon Mac:
 | Next tool calls | ~2 ms | ~2 ms |
 | After 10 idle minutes | still running | stopped |
 
+## Agent setup
+
+Paste this into your coding agent:
+
+> Install mcp-nap with `cargo install --git https://github.com/MatteoGauthier/mcp-nap`, then for each local stdio MCP server configured in my coding agents and editors, propose putting the full path of `mcp-nap` before its command, show me the diff with secrets masked, and write the files only after I approve.
+
 ## Install
 
 ```sh
-cargo install --path .
+cargo install --git https://github.com/MatteoGauthier/mcp-nap
 ```
 
-This puts `mcp-nap` in `~/.cargo/bin`. macOS and Linux only.
+This puts `mcp-nap` in `~/.cargo/bin`. It needs Rust 1.88 or later, and runs on macOS and Linux only. From a clone, use `cargo install --path .`.
 
 ## Use
 
