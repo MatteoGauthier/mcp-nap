@@ -143,6 +143,10 @@ impl Sandbox {
 struct Client {
     service: RunningService<RoleClient, Recorder>,
     changed: mpsc::UnboundedReceiver<&'static str>,
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "only the Unix signal test reads it")
+    )]
     mcp_nap: u32,
 }
 
@@ -189,12 +193,21 @@ impl Client {
     }
 }
 
+#[cfg(unix)]
 fn is_running(pid: u32) -> bool {
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+#[cfg(windows)]
+fn is_running(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+        .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\"")))
 }
 
 async fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
@@ -381,6 +394,7 @@ async fn per_dir_keeps_one_cache_per_working_folder() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_terminate_signal_stops_the_server_with_mcp_nap() {
     let sandbox = Sandbox::new();

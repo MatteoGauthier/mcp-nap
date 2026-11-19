@@ -2,9 +2,14 @@ use std::io;
 use std::process::Stdio;
 use std::time::Duration;
 
-use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop, ProcessGroup};
+#[cfg(windows)]
+use process_wrap::tokio::JobObject;
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
+#[cfg(unix)]
 use tokio::signal::unix::SignalKind;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::timeout;
@@ -15,7 +20,7 @@ pub enum Output {
     Closed(u64),
 }
 
-/// The real MCP server, leader of its own process group.
+/// The real MCP server, in its own process group on Unix and its own job object on Windows.
 pub struct Server {
     child: Box<dyn ChildWrapper>,
     stdin: Option<ChildStdin>,
@@ -34,7 +39,11 @@ impl Server {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit());
         });
-        wrap.wrap(ProcessGroup::leader()).wrap(KillOnDrop);
+        wrap.wrap(KillOnDrop);
+        #[cfg(unix)]
+        wrap.wrap(ProcessGroup::leader());
+        #[cfg(windows)]
+        wrap.wrap(JobObject);
         let mut child = wrap.spawn()?;
         let stdin = child.stdin().take();
         let stdout = child.stdout().take().expect("stdout is piped");
@@ -57,15 +66,18 @@ impl Server {
         stdin.flush().await
     }
 
-    /// The stdio shutdown of the MCP spec: close stdin, then SIGTERM, then SIGKILL, waiting `grace` between each.
+    /// The stdio shutdown of the MCP spec: close stdin, then SIGTERM on Unix, then kill, waiting `grace` between each.
     pub async fn stop(mut self, grace: Duration) {
         drop(self.stdin.take());
         if self.exited_within(grace).await {
             return;
         }
-        let _ = self.child.signal(SignalKind::terminate().as_raw_value());
-        if self.exited_within(grace).await {
-            return;
+        #[cfg(unix)]
+        {
+            let _ = self.child.signal(SignalKind::terminate().as_raw_value());
+            if self.exited_within(grace).await {
+                return;
+            }
         }
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;

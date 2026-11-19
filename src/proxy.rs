@@ -6,7 +6,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWriteExt;
-use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::{sleep_until, timeout};
@@ -27,7 +26,7 @@ pub struct Config {
 /// Wait between the stop steps when the server is idle or the client has left.
 const STOP_GRACE: Duration = Duration::from_secs(2);
 
-/// Wait between the stop steps when the client signals mcp-nap, as clients escalate to SIGKILL within about half a second.
+/// Wait between the stop steps when the client stops mcp-nap, as clients escalate to a kill within about half a second.
 const SIGNAL_GRACE: Duration = Duration::from_millis(150);
 
 pub async fn run(config: Config) -> io::Result<()> {
@@ -47,9 +46,7 @@ pub async fn run(config: Config) -> io::Result<()> {
     });
 
     let (server_output, mut output) = mpsc::unbounded_channel();
-    let mut interrupt = signal(SignalKind::interrupt())?;
-    let mut terminate = signal(SignalKind::terminate())?;
-    let mut hangup = signal(SignalKind::hangup())?;
+    let mut stop_signals = StopSignals::new()?;
     let mut io = Io {
         command: config.command,
         server: None,
@@ -79,9 +76,7 @@ pub async fn run(config: Config) -> io::Result<()> {
             _ = sleep_until(deadline.unwrap_or_else(Instant::now).into()), if deadline.is_some() => {
                 session.on_tick(Instant::now())
             }
-            _ = interrupt.recv() => break SIGNAL_GRACE,
-            _ = terminate.recv() => break SIGNAL_GRACE,
-            _ = hangup.recv() => break SIGNAL_GRACE,
+            () = stop_signals.recv() => break SIGNAL_GRACE,
         };
         if io.perform(actions, &mut session).await.is_err() {
             // the client stopped reading
@@ -152,5 +147,61 @@ impl Io {
             }
         }
         Ok(())
+    }
+}
+
+/// How a client asks mcp-nap to stop: SIGINT, SIGTERM or SIGHUP on Unix.
+#[cfg(unix)]
+struct StopSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl StopSignals {
+    fn new() -> io::Result<StopSignals> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(StopSignals {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+            hangup: signal(SignalKind::hangup())?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+            _ = self.hangup.recv() => {}
+        }
+    }
+}
+
+/// How a client asks mcp-nap to stop: Ctrl+C, a closed console or a system shutdown on Windows.
+#[cfg(windows)]
+struct StopSignals {
+    ctrl_c: tokio::signal::windows::CtrlC,
+    close: tokio::signal::windows::CtrlClose,
+    shutdown: tokio::signal::windows::CtrlShutdown,
+}
+
+#[cfg(windows)]
+impl StopSignals {
+    fn new() -> io::Result<StopSignals> {
+        use tokio::signal::windows::{ctrl_c, ctrl_close, ctrl_shutdown};
+        Ok(StopSignals {
+            ctrl_c: ctrl_c()?,
+            close: ctrl_close()?,
+            shutdown: ctrl_shutdown()?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.ctrl_c.recv() => {}
+            _ = self.close.recv() => {}
+            _ = self.shutdown.recv() => {}
+        }
     }
 }
