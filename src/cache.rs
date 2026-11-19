@@ -20,8 +20,18 @@ const MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Private results stay in this session, since another session may hold other credentials.
 pub struct Cache {
     path: PathBuf,
-    shared: HashMap<String, Entry>,
+    shared: Stored,
     private: HashMap<String, Entry>,
+}
+
+/// What a cache file holds.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Stored {
+    /// the server program, without its arguments, which may hold secrets
+    program: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    working_dir: Option<PathBuf>,
+    entries: HashMap<String, Entry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,10 +45,12 @@ impl Cache {
     /// Opens the cache of `command`, kept apart per `working_dir` when one is given.
     pub fn open(dir: &Path, command: &[String], working_dir: Option<&Path>) -> Cache {
         let path = dir.join(file_name(command, working_dir));
-        let shared = fs::read(&path)
+        let mut shared: Stored = fs::read(&path)
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
+        shared.program = command[0].clone();
+        shared.working_dir = working_dir.map(Path::to_path_buf);
         Cache {
             path,
             shared,
@@ -51,7 +63,7 @@ impl Cache {
         let now = unix_ms(now);
         self.private
             .get(key)
-            .or_else(|| self.shared.get(key))
+            .or_else(|| self.shared.entries.get(key))
             .filter(|entry| entry.expires_at_ms.is_none_or(|at| at > now))
             .map(|entry| &entry.result)
     }
@@ -60,14 +72,14 @@ impl Cache {
     pub fn put(&mut self, key: &str, result: Value, now: SystemTime) {
         let hints = Hints::of(&result);
         self.private.remove(key);
-        let shared_before = self.shared.remove(key);
+        let shared_before = self.shared.entries.remove(key);
         let entry = |ttl: Option<Duration>| Entry {
             expires_at_ms: ttl.map(|ttl| unix_ms(now) + ttl.as_millis() as u64),
             result,
         };
         match hints {
             Hints::None => {
-                self.shared.insert(key.to_owned(), entry(None));
+                self.shared.entries.insert(key.to_owned(), entry(None));
             }
             Hints::Ttl { ttl, .. } if ttl.is_zero() => {}
             Hints::Ttl {
@@ -77,10 +89,10 @@ impl Cache {
                 self.private.insert(key.to_owned(), entry(Some(ttl)));
             }
             Hints::Ttl { ttl, .. } => {
-                self.shared.insert(key.to_owned(), entry(Some(ttl)));
+                self.shared.entries.insert(key.to_owned(), entry(Some(ttl)));
             }
         }
-        if self.shared.get(key) != shared_before.as_ref() {
+        if self.shared.entries.get(key) != shared_before.as_ref() {
             self.save();
         }
     }
@@ -89,9 +101,9 @@ impl Cache {
     pub fn forget(&mut self, method: &str) {
         let matches = |key: &String| key == method || key.starts_with(&format!("{method}@"));
         self.private.retain(|key, _| !matches(key));
-        let before = self.shared.len();
-        self.shared.retain(|key, _| !matches(key));
-        if self.shared.len() != before {
+        let before = self.shared.entries.len();
+        self.shared.entries.retain(|key, _| !matches(key));
+        if self.shared.entries.len() != before {
             self.save();
         }
     }
@@ -113,6 +125,144 @@ impl Cache {
         fs::write(&temporary, serde_json::to_vec(&self.shared)?)?;
         fs::rename(&temporary, &self.path)
     }
+}
+
+/// Removes the cache of `command`, kept per `working_dir` when given, or every cache file in `dir` without one.
+///
+/// Returns how many files were removed. Files mcp-nap did not write are left alone.
+pub fn clear(dir: &Path, command: Option<(&[String], Option<&Path>)>) -> io::Result<usize> {
+    let mut removed = 0;
+    for file in cache_files(dir, command)? {
+        match fs::remove_file(&file) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(removed)
+}
+
+/// One cached server, as `--show-cache` lists it.
+pub struct Summary {
+    /// the server program, `None` for a file written by an older mcp-nap
+    pub program: Option<String>,
+    pub working_dir: Option<PathBuf>,
+    /// name and version the server reported in its handshake or discover result
+    pub server: Option<String>,
+    pub entries: Vec<EntrySummary>,
+}
+
+pub struct EntrySummary {
+    pub key: String,
+    /// how many tools, prompts, resources or templates a list holds
+    pub items: Option<usize>,
+    pub freshness: Freshness,
+}
+
+pub enum Freshness {
+    /// no `ttlMs`: kept until a running server lists something else
+    UntilChanged,
+    Fresh(Duration),
+    Stale,
+}
+
+/// The cached servers in `dir`, or only the one of `command`, sorted by program.
+pub fn summaries(
+    dir: &Path,
+    command: Option<(&[String], Option<&Path>)>,
+    now: SystemTime,
+) -> io::Result<Vec<Summary>> {
+    let mut summaries: Vec<Summary> = cache_files(dir, command)?
+        .into_iter()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .filter_map(|path| fs::read(path).ok())
+        .map(|bytes| summarize(&bytes, now))
+        .collect();
+    summaries.sort_by(|a, b| a.program.cmp(&b.program));
+    Ok(summaries)
+}
+
+fn summarize(bytes: &[u8], now: SystemTime) -> Summary {
+    let Ok(stored) = serde_json::from_slice::<Stored>(bytes) else {
+        return Summary {
+            program: None,
+            working_dir: None,
+            server: None,
+            entries: Vec::new(),
+        };
+    };
+    let now = unix_ms(now);
+    let server = stored
+        .entries
+        .values()
+        .find_map(|entry| server_info(&entry.result));
+    let mut entries: Vec<EntrySummary> = stored
+        .entries
+        .into_iter()
+        .map(|(key, entry)| EntrySummary {
+            items: ["tools", "prompts", "resources", "resourceTemplates"]
+                .iter()
+                .find_map(|list| entry.result.get(list)?.as_array().map(Vec::len)),
+            freshness: match entry.expires_at_ms {
+                None => Freshness::UntilChanged,
+                Some(at) if at > now => Freshness::Fresh(Duration::from_millis(at - now)),
+                Some(_) => Freshness::Stale,
+            },
+            key,
+        })
+        .collect();
+    entries.sort_by(|a, b| a.key.cmp(&b.key));
+    Summary {
+        program: Some(stored.program),
+        working_dir: stored.working_dir,
+        server,
+        entries,
+    }
+}
+
+/// `name version` from an `initialize` result, or from the server info of a `server/discover` result.
+fn server_info(result: &Value) -> Option<String> {
+    let info = result
+        .get("serverInfo")
+        .or_else(|| result.pointer("/_meta/io.modelcontextprotocol~1serverInfo"))?;
+    let name = info.get("name")?.as_str()?;
+    Some(match info.get("version").and_then(Value::as_str) {
+        Some(version) => format!("{name} {version}"),
+        None => name.to_owned(),
+    })
+}
+
+/// The cache file of `command`, or every file mcp-nap wrote in `dir` without one.
+fn cache_files(
+    dir: &Path,
+    command: Option<(&[String], Option<&Path>)>,
+) -> io::Result<Vec<PathBuf>> {
+    if let Some((command, working_dir)) = command {
+        return Ok(vec![dir.join(file_name(command, working_dir))]);
+    }
+    match fs::read_dir(dir) {
+        Ok(entries) => Ok(entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| is_cache_file(path))
+            .collect()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
+}
+
+/// A file mcp-nap wrote: a SHA-256 name ending in `.json`, or a temporary copy of one.
+fn is_cache_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let digest = name.split('.').next().unwrap_or_default();
+    digest.len() == 64
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && (name.ends_with(".json") || name.ends_with(".tmp"))
 }
 
 /// The cache key of `method` for a client speaking `version`.
@@ -241,6 +391,85 @@ mod tests {
         let reopened = Cache::open(dir.path(), &server, None);
         assert_eq!(reopened.get("tools/list@2026-07-28", at(1)), None);
         assert_eq!(reopened.get("prompts/list@2026-07-28", at(1)), None);
+    }
+
+    #[test]
+    fn clear_removes_one_server_or_every_cache_file_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let (one, two) = (command(&["one"]), command(&["two"]));
+        let tools = json!({ "tools": [] });
+        Cache::open(dir.path(), &one, None).put("tools/list@v", tools.clone(), at(0));
+        Cache::open(dir.path(), &two, None).put("tools/list@v", tools.clone(), at(0));
+        fs::write(dir.path().join("notes.json"), "{}").unwrap();
+
+        assert_eq!(clear(dir.path(), Some((&one, None))).unwrap(), 1);
+        assert_eq!(
+            Cache::open(dir.path(), &one, None).get("tools/list@v", at(0)),
+            None
+        );
+        assert_eq!(
+            Cache::open(dir.path(), &two, None).get("tools/list@v", at(0)),
+            Some(&tools)
+        );
+
+        assert_eq!(clear(dir.path(), None).unwrap(), 1);
+        assert!(dir.path().join("notes.json").exists());
+        assert_eq!(clear(&dir.path().join("missing"), None).unwrap(), 0);
+    }
+
+    #[test]
+    fn summaries_name_the_server_and_describe_each_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = command(&["/bin/server", "--token", "secret"]);
+        let mut cache = Cache::open(dir.path(), &server, None);
+        let initialize = json!({ "protocolVersion": "2025-11-25", "serverInfo": { "name": "demo", "version": "1.2" } });
+        cache.put("initialize@2025-11-25", initialize, at(0));
+        cache.put("tools/list@2025-11-25", json!({ "tools": [{}, {}] }), at(0));
+        cache.put(
+            "prompts/list@2026-07-28",
+            json!({ "prompts": [{}], "ttlMs": 60_000, "cacheScope": "public" }),
+            at(0),
+        );
+
+        let summaries = summaries(dir.path(), None, at(30)).unwrap();
+        let [summary] = summaries.as_slice() else {
+            panic!("one cached server");
+        };
+        assert_eq!(summary.program.as_deref(), Some("/bin/server"));
+        assert_eq!(summary.server.as_deref(), Some("demo 1.2"));
+        let described: Vec<_> = summary
+            .entries
+            .iter()
+            .map(|entry| {
+                let freshness = match entry.freshness {
+                    Freshness::UntilChanged => "until changed".to_owned(),
+                    Freshness::Fresh(left) => format!("fresh {}s", left.as_secs()),
+                    Freshness::Stale => "stale".to_owned(),
+                };
+                (entry.key.as_str(), entry.items, freshness)
+            })
+            .collect();
+        assert_eq!(
+            described,
+            [
+                ("initialize@2025-11-25", None, "until changed".to_owned()),
+                ("prompts/list@2026-07-28", Some(1), "fresh 30s".to_owned()),
+                ("tools/list@2025-11-25", Some(2), "until changed".to_owned()),
+            ]
+        );
+        let file = fs::read_to_string(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path(),
+        )
+        .unwrap();
+        assert!(
+            !file.contains("secret"),
+            "arguments stay out of the cache file"
+        );
     }
 
     #[test]
