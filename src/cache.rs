@@ -83,3 +83,46 @@ fn command_hash(command: &[String]) -> u64 {
     }
     hash
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn command(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| part.to_string()).collect()
+    }
+
+    #[test]
+    fn keeps_entries_across_opens() {
+        let dir = env::temp_dir().join(format!("mcp-nap-cache-{}", std::process::id()));
+        let server = command(&["server", "--flag"]);
+
+        let mut cache = Cache::open(&dir, &server);
+        cache.set("tools/list", json!({ "tools": [] }));
+        cache.set("prompts/list", json!({ "prompts": [] }));
+        cache.remove("prompts/list");
+
+        let reopened = Cache::open(&dir, &server);
+        assert_eq!(reopened.get("tools/list"), Some(&json!({ "tools": [] })));
+        assert_eq!(reopened.get("prompts/list"), None);
+        assert_eq!(
+            Cache::open(&dir, &command(&["other"])).get("tools/list"),
+            None
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn hash_separates_arguments() {
+        assert_ne!(
+            command_hash(&command(&["ab", "c"])),
+            command_hash(&command(&["a", "bc"]))
+        );
+        assert_eq!(
+            command_hash(&command(&["server"])),
+            command_hash(&command(&["server"]))
+        );
+    }
+}
