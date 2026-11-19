@@ -9,6 +9,7 @@ use rmcp::model::CacheScope;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tracing::warn;
 
 /// Longest `ttlMs` honored, the same cap as the rmcp client cache.
 const MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -97,7 +98,7 @@ impl Cache {
 
     fn save(&self) {
         if let Err(error) = self.write() {
-            eprintln!("mcp-nap: cannot write {}: {error}", self.path.display());
+            warn!("cannot write {}: {error}", self.path.display());
         }
     }
 

@@ -10,6 +10,7 @@ use rmcp::model::{
     ServerResult,
 };
 use serde_json::{Value, json};
+use tracing::{debug, error, info};
 
 use crate::cache::{self, Cache};
 
@@ -200,6 +201,7 @@ impl Session {
         self.tasks
             .retain(|_, expiry| expiry.is_none_or(|at| at > now));
         if self.idle_deadline().is_some_and(|deadline| deadline <= now) {
+            debug!("idle for {:?}", self.idle);
             self.stop();
         }
         mem::take(&mut self.actions)
@@ -216,6 +218,7 @@ impl Session {
                     log_level: None,
                 };
                 if let Some(result) = self.cache.get(&key, SystemTime::now()).cloned() {
+                    debug!(%key, "answered from the cache");
                     return self.reply(id, result);
                 }
                 self.pending.insert(id, Some(key));
@@ -242,14 +245,16 @@ impl Session {
                     };
                 }
                 let key = self.cache_key(&request);
-                if let (false, Some(key)) = (self.running, &key) {
-                    if let Some(result) = self.cache.get(key, SystemTime::now()).cloned() {
-                        return self.reply(id, result);
-                    }
+                if let (false, Some(key)) = (self.running, &key)
+                    && let Some(result) = self.cache.get(key, SystemTime::now()).cloned()
+                {
+                    debug!(%key, "answered from the cache");
+                    return self.reply(id, result);
                 }
                 if matches!(request, ClientRequest::SubscribeRequest(_)) {
                     self.subscribed = true;
                 }
+                debug!(method = request.method(), "forwarded to the server");
                 self.pending.insert(id, key);
                 self.forward(line);
             }
@@ -321,6 +326,7 @@ impl Session {
             Internal::SetLevel => {}
             Internal::Refresh { key, notification } => {
                 if self.cache.get(&key, SystemTime::now()) != Some(result) {
+                    info!(%key, "the server lists something new, telling the client");
                     self.cache.put(&key, result.clone(), SystemTime::now());
                     self.send_client(
                         json!({ "jsonrpc": "2.0", "method": notification }).to_string(),
@@ -332,7 +338,7 @@ impl Session {
 
     fn on_internal_error(&mut self, kind: Internal) {
         if let Internal::Initialize = kind {
-            eprintln!("mcp-nap: the server rejected the replayed initialize");
+            error!("the server rejected the replayed initialize");
             self.stop();
             self.fail_pending("mcp-nap: the server rejected the replayed initialize");
         }
@@ -369,11 +375,12 @@ impl Session {
                 .task
                 .ttl_ms
                 .map(|ttl_ms| now + Duration::from_millis(ttl_ms));
+            debug!(task = %created.task.task_id, "a task keeps the server awake");
             self.tasks.insert(created.task.task_id, expiry);
-        } else if let Ok(current) = serde_json::from_value::<GetTaskResult>(result.clone()) {
-            if current.task.status().is_terminal() {
-                self.tasks.remove(&current.task.task.task_id);
-            }
+        } else if let Ok(current) = serde_json::from_value::<GetTaskResult>(result.clone())
+            && current.task.status().is_terminal()
+        {
+            self.tasks.remove(&current.task.task.task_id);
         }
     }
 

@@ -10,6 +10,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::{sleep_until, timeout};
+use tracing::{error, info, warn};
 
 use crate::cache::Cache;
 use crate::server::{Output, Server};
@@ -70,7 +71,7 @@ pub async fn run(config: Config) -> io::Result<()> {
                     session.on_server(&line, Instant::now())
                 }
                 Output::Closed(generation) if generation == io.generation => {
-                    eprintln!("mcp-nap: the server exited");
+                    warn!("the server exited");
                     session.on_server_exit("mcp-nap: the server exited")
                 }
                 _ => continue,
@@ -89,6 +90,7 @@ pub async fn run(config: Config) -> io::Result<()> {
     };
 
     if let Some(server) = io.server.take() {
+        info!("stopping the server");
         io.stopping.spawn(server.stop(grace));
     }
     let _ = timeout(grace * 3, io.stopping.join_all()).await;
@@ -116,13 +118,13 @@ impl Io {
                     match Server::spawn(&self.command, self.generation, self.server_output.clone())
                     {
                         Ok(server) => {
-                            eprintln!("mcp-nap: starting server");
+                            info!("started the server");
                             self.server = Some(server);
                         }
                         Err(error) => {
+                            error!("cannot start {}: {error}", self.command[0]);
                             let reason =
                                 format!("mcp-nap: cannot start {}: {error}", self.command[0]);
-                            eprintln!("{reason}");
                             actions.extend(session.on_server_exit(&reason));
                         }
                     }
@@ -130,7 +132,7 @@ impl Io {
                 Action::Stop => {
                     self.generation += 1;
                     if let Some(server) = self.server.take() {
-                        eprintln!("mcp-nap: stopping server");
+                        info!("stopping the server");
                         self.stopping.spawn(server.stop(STOP_GRACE));
                     }
                 }
