@@ -1,88 +1,137 @@
+//! mcp-nap between the official rmcp client and an rmcp server, on both MCP protocol versions.
+
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Stdio;
+use std::sync::OnceLock;
+use std::time::Duration;
 
-use serde_json::{Value, json};
+use rmcp::model::{CallToolRequestParams, ProtocolVersion};
+use rmcp::service::{ClientInitializeError, NotificationContext, RunningService, ServiceError};
+use rmcp::transport::TokioChildProcess;
+use rmcp::{ClientHandler, ClientLifecycleMode, ClientServiceExt, RoleClient};
+use tempfile::TempDir;
+use tokio::process::Command;
+use tokio::sync::mpsc;
+use tokio::time::{sleep, timeout};
 
-const TIMEOUT: Duration = Duration::from_secs(10);
+const TIMEOUT: Duration = Duration::from_secs(20);
 
-/// A temporary cache directory and server log for one test.
+#[derive(Clone, Copy)]
+enum Protocol {
+    /// the `initialize` handshake of 2025-11-25 and earlier
+    Legacy,
+    /// `server/discover` and per-request metadata of 2026-07-28
+    Modern,
+}
+
+fn fake_server() -> &'static Path {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        escargot::CargoBuild::new()
+            .example("fake_server")
+            .current_release()
+            .current_target()
+            .run()
+            .expect("the fake server builds")
+            .path()
+            .to_owned()
+    })
+}
+
+/// Records the list changes mcp-nap announces to the client.
+struct Recorder {
+    changes: mpsc::UnboundedSender<&'static str>,
+}
+
+impl ClientHandler for Recorder {
+    async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        let _ = self.changes.send("tools");
+    }
+
+    async fn on_prompt_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        let _ = self.changes.send("prompts");
+    }
+}
+
+/// A cache folder and a server log for one test.
 struct Sandbox {
-    dir: PathBuf,
+    dir: TempDir,
 }
 
 impl Sandbox {
-    fn new(name: &str) -> Sandbox {
-        let dir = std::env::temp_dir().join(format!("mcp-nap-test-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        Sandbox { dir }
-    }
-
-    fn session(&self, idle: u64, tools: &str) -> Session {
-        self.launch(
-            &["--idle", &idle.to_string()],
-            &fake_server(),
-            &[("FAKE_SERVER_TOOLS", tools)],
-            &self.dir,
-        )
-    }
-
-    /// Starts mcp-nap with extra `options` in front of `server`, from the working folder `cwd`.
-    fn launch(&self, options: &[&str], server: &Path, env: &[(&str, &str)], cwd: &Path) -> Session {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_mcp-nap"))
-            .arg("--cache-dir")
-            .arg(self.dir.join("cache"))
-            .args(options)
-            .arg(server)
-            .current_dir(cwd)
-            .env("FAKE_SERVER_LOG", self.dir.join("server.log"))
-            .envs(env.iter().copied())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let (sender, messages) = mpsc::channel();
-        thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                if sender.send(serde_json::from_str(&line).unwrap()).is_err() {
-                    break;
-                }
-            }
-        });
-        Session {
-            stdin: child.stdin.take(),
-            child,
-            messages,
-            notifications: Vec::new(),
+    fn new() -> Sandbox {
+        Sandbox {
+            dir: tempfile::tempdir().unwrap(),
         }
     }
 
+    async fn connect(&self, protocol: Protocol, options: &[&str], env: &[(&str, &str)]) -> Client {
+        self.try_connect(protocol, options, env, self.dir.path(), fake_server())
+            .await
+            .expect("the client connects")
+    }
+
+    async fn try_connect(
+        &self,
+        protocol: Protocol,
+        options: &[&str],
+        env: &[(&str, &str)],
+        cwd: &Path,
+        server: &Path,
+    ) -> Result<Client, ClientInitializeError> {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mcp-nap"));
+        command
+            .arg("--cache-dir")
+            .arg(self.dir.path().join("cache"))
+            .args(options)
+            .arg(server)
+            .current_dir(cwd)
+            .env("FAKE_SERVER_LOG", self.dir.path().join("server.log"))
+            .envs(env.iter().copied());
+        let (transport, _) = TokioChildProcess::builder(command)
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("mcp-nap starts");
+        let mcp_nap = transport.id().expect("mcp-nap has a pid");
+        let lifecycle = match protocol {
+            Protocol::Legacy => ClientLifecycleMode::Initialize,
+            Protocol::Modern => ClientLifecycleMode::Discover {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            },
+        };
+        let (changes, changed) = mpsc::unbounded_channel();
+        let service = timeout(
+            TIMEOUT,
+            Recorder { changes }.serve_with_lifecycle(transport, lifecycle),
+        )
+        .await
+        .expect("the handshake finishes in time")?;
+        Ok(Client {
+            service,
+            changed,
+            mcp_nap,
+        })
+    }
+
     /// Runs one session so the next ones start with a full cache, then clears the log.
-    fn fill_cache(&self, tools: &str) {
-        let mut session = self.session(600, tools);
-        session.handshake();
-        session.request(2, "tools/list", json!({}));
-        session.close();
-        let _ = fs::remove_file(self.dir.join("server.log"));
+    async fn fill_cache(&self, protocol: Protocol, env: &[(&str, &str)]) {
+        let client = self.connect(protocol, &[], env).await;
+        client.tool_names().await;
+        client.prompt_names().await;
+        client.close().await;
+        let _ = fs::remove_file(self.dir.path().join("server.log"));
     }
 
     fn log(&self) -> Vec<String> {
-        fs::read_to_string(self.dir.join("server.log"))
+        fs::read_to_string(self.dir.path().join("server.log"))
             .unwrap_or_default()
             .lines()
             .map(str::to_owned)
             .collect()
     }
 
-    fn started_pids(&self) -> Vec<i32> {
+    fn started_pids(&self) -> Vec<u32> {
         self.log()
             .iter()
             .filter_map(|entry| entry.strip_prefix("start "))
@@ -91,269 +140,262 @@ impl Sandbox {
     }
 }
 
-impl Drop for Sandbox {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
+struct Client {
+    service: RunningService<RoleClient, Recorder>,
+    changed: mpsc::UnboundedReceiver<&'static str>,
+    mcp_nap: u32,
+}
+
+impl Client {
+    async fn tool_names(&self) -> Vec<String> {
+        let tools = self.service.list_tools(None).await.expect("tools/list");
+        tools
+            .tools
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect()
+    }
+
+    async fn prompt_names(&self) -> Vec<String> {
+        let prompts = self.service.list_prompts(None).await.expect("prompts/list");
+        prompts
+            .prompts
+            .into_iter()
+            .map(|prompt| prompt.name)
+            .collect()
+    }
+
+    async fn call(&self, tool: &str) -> Result<String, ServiceError> {
+        let result = self
+            .service
+            .call_tool(CallToolRequestParams::new(tool.to_owned()))
+            .await?;
+        Ok(result.content[0]
+            .as_text()
+            .expect("a text result")
+            .text
+            .clone())
+    }
+
+    async fn next_change(&mut self) -> &'static str {
+        timeout(TIMEOUT, self.changed.recv())
+            .await
+            .expect("a list change in time")
+            .expect("the client is open")
+    }
+
+    async fn close(self) {
+        let _ = self.service.cancel().await;
     }
 }
 
-/// One client connected to mcp-nap.
-struct Session {
-    child: Child,
-    stdin: Option<ChildStdin>,
-    messages: Receiver<Value>,
-    notifications: Vec<Value>,
+fn is_running(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
-impl Session {
-    fn send(&mut self, message: Value) {
-        let stdin = self.stdin.as_mut().unwrap();
-        writeln!(stdin, "{message}").unwrap();
-        stdin.flush().unwrap();
-    }
-
-    fn request(&mut self, id: u64, method: &str, params: Value) -> Value {
-        self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
-        loop {
-            let message = self.messages.recv_timeout(TIMEOUT).expect("no response");
-            if message["id"] == id {
-                return message;
-            }
-            self.notifications.push(message);
-        }
-    }
-
-    fn handshake(&mut self) -> Value {
-        let response = self.request(
-            1,
-            "initialize",
-            json!({ "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "test", "version": "0" } }),
-        );
-        self.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
-        response
-    }
-
-    fn call(&mut self, id: u64, tool: &str) -> Value {
-        self.request(id, "tools/call", json!({ "name": tool, "arguments": {} }))
-    }
-
-    fn wait_for_notification(&mut self, method: &str) -> Value {
-        if let Some(index) = self
-            .notifications
-            .iter()
-            .position(|message| message["method"] == method)
-        {
-            return self.notifications.remove(index);
-        }
-        loop {
-            let message = self
-                .messages
-                .recv_timeout(TIMEOUT)
-                .expect("no notification");
-            if message["method"] == method {
-                return message;
-            }
-        }
-    }
-
-    fn close(mut self) {
-        drop(self.stdin.take());
-        assert!(
-            wait_until(|| self.child.try_wait().unwrap().is_some()),
-            "mcp-nap did not exit"
-        );
-    }
-}
-
-fn fake_server() -> PathBuf {
-    Path::new(env!("CARGO_BIN_EXE_mcp-nap"))
-        .parent()
-        .unwrap()
-        .join("examples/fake_server")
-}
-
-fn is_running(pid: i32) -> bool {
-    unsafe { libc::kill(pid, 0) == 0 }
-}
-
-fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline {
+async fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+    for _ in 0..500 {
         if condition() {
             return true;
         }
-        thread::sleep(Duration::from_millis(20));
+        sleep(Duration::from_millis(20)).await;
     }
     false
 }
 
-fn text(response: &Value) -> &str {
-    response["result"]["content"][0]["text"].as_str().unwrap()
-}
+#[tokio::test]
+async fn a_first_legacy_session_passes_through_and_fills_the_cache() {
+    let sandbox = Sandbox::new();
+    let client = sandbox.connect(Protocol::Legacy, &[], &[]).await;
 
-#[test]
-fn first_session_passes_the_handshake_through_and_fills_the_cache() {
-    let sandbox = Sandbox::new("first");
-    let mut session = sandbox.session(600, "echo");
-
-    assert_eq!(session.handshake()["result"]["serverInfo"]["name"], "fake");
-    assert_eq!(
-        session.request(2, "tools/list", json!({}))["result"]["tools"][0]["name"],
-        "echo"
-    );
+    assert_eq!(client.tool_names().await, ["echo"]);
     assert_eq!(sandbox.started_pids().len(), 1);
-    session.close();
+    client.close().await;
 
-    assert_eq!(fs::read_dir(sandbox.dir.join("cache")).unwrap().count(), 1);
+    assert_eq!(
+        fs::read_dir(sandbox.dir.path().join("cache"))
+            .unwrap()
+            .count(),
+        1
+    );
 }
 
-#[test]
-fn cached_session_starts_the_server_only_for_a_tool_call() {
-    let sandbox = Sandbox::new("cached");
-    sandbox.fill_cache("echo");
-    let mut session = sandbox.session(600, "echo");
+#[tokio::test]
+async fn a_warm_legacy_session_starts_the_server_only_for_a_tool_call() {
+    let sandbox = Sandbox::new();
+    sandbox.fill_cache(Protocol::Legacy, &[]).await;
+    let client = sandbox.connect(Protocol::Legacy, &[], &[]).await;
 
-    assert_eq!(session.handshake()["result"]["serverInfo"]["name"], "fake");
-    assert_eq!(
-        session.request(2, "tools/list", json!({}))["result"]["tools"][0]["name"],
-        "echo"
-    );
-    assert_eq!(session.request(3, "ping", json!({}))["result"], json!({}));
+    assert_eq!(client.tool_names().await, ["echo"]);
+    assert_eq!(client.prompt_names().await, ["greet"]);
     assert!(
         sandbox.log().is_empty(),
-        "server started too early: {:?}",
+        "started too early: {:?}",
         sandbox.log()
     );
 
-    assert_eq!(text(&session.call(4, "echo")), "called echo");
-    assert_eq!(
-        sandbox.log()[1..4],
-        ["initialize", "notifications/initialized", "tools/call"]
-    );
-
+    assert_eq!(client.call("echo").await.unwrap(), "called echo");
     let pid = sandbox.started_pids()[0];
-    session.close();
-    assert!(wait_until(|| !is_running(pid)), "server outlived mcp-nap");
+    client.close().await;
+    assert!(
+        wait_until(|| !is_running(pid)).await,
+        "the server outlived mcp-nap"
+    );
 }
 
-#[test]
-fn idle_server_is_stopped_and_started_again() {
-    let sandbox = Sandbox::new("idle");
-    sandbox.fill_cache("echo");
-    let mut session = sandbox.session(1, "echo");
-    session.handshake();
+#[tokio::test]
+async fn an_idle_server_is_stopped_and_started_again() {
+    let sandbox = Sandbox::new();
+    sandbox.fill_cache(Protocol::Legacy, &[]).await;
+    let client = sandbox
+        .connect(Protocol::Legacy, &["--idle", "1"], &[])
+        .await;
 
-    assert_eq!(text(&session.call(2, "echo")), "called echo");
+    assert_eq!(client.call("echo").await.unwrap(), "called echo");
     let first = sandbox.started_pids()[0];
     assert!(
-        wait_until(|| !is_running(first)),
-        "idle server was not stopped"
+        wait_until(|| !is_running(first)).await,
+        "the idle server was not stopped"
     );
 
-    assert_eq!(text(&session.call(3, "echo")), "called echo");
+    assert_eq!(client.call("echo").await.unwrap(), "called echo");
     assert_eq!(sandbox.started_pids().len(), 2);
-    session.close();
+    client.close().await;
 }
 
-#[test]
-fn changed_tools_are_announced_after_a_start() {
-    let sandbox = Sandbox::new("changed");
-    sandbox.fill_cache("echo");
-    let mut session = sandbox.session(600, "echo,extra");
-    session.handshake();
+#[tokio::test]
+async fn changed_lists_are_announced_after_a_legacy_start() {
+    let sandbox = Sandbox::new();
+    sandbox.fill_cache(Protocol::Legacy, &[]).await;
+    let changed = [
+        ("FAKE_SERVER_TOOLS", "echo,extra"),
+        ("FAKE_SERVER_PROMPTS", "greet,bye"),
+    ];
+    let mut client = sandbox.connect(Protocol::Legacy, &[], &changed).await;
 
-    assert_eq!(
-        session.request(2, "tools/list", json!({}))["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    session.call(3, "echo");
-    session.wait_for_notification("notifications/tools/list_changed");
-    assert_eq!(
-        session.request(4, "tools/list", json!({}))["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
-    session.close();
+    assert_eq!(client.tool_names().await, ["echo"], "the cached list");
+    client.call("echo").await.unwrap();
+    let mut changes = [client.next_change().await, client.next_change().await];
+    changes.sort();
+    assert_eq!(changes, ["prompts", "tools"]);
+    assert_eq!(client.tool_names().await, ["echo", "extra"]);
+    client.close().await;
 }
 
-#[test]
-fn changed_prompts_are_announced_after_a_start() {
-    let sandbox = Sandbox::new("prompts");
-    let open = |prompts: &str| {
-        sandbox.launch(
-            &[],
-            &fake_server(),
-            &[("FAKE_SERVER_PROMPTS", prompts)],
-            &sandbox.dir,
-        )
-    };
-    let prompt_count = |response: Value| response["result"]["prompts"].as_array().unwrap().len();
+#[tokio::test]
+async fn a_modern_session_answers_from_the_cache_when_the_server_allows_it() {
+    let sandbox = Sandbox::new();
+    let cacheable = [("FAKE_SERVER_TTL_MS", "60000")];
+    sandbox.fill_cache(Protocol::Modern, &cacheable).await;
+    let client = sandbox.connect(Protocol::Modern, &[], &cacheable).await;
 
-    let mut session = open("greet");
-    session.handshake();
-    session.request(2, "prompts/list", json!({}));
-    session.close();
+    assert_eq!(client.tool_names().await, ["echo"]);
+    assert!(
+        sandbox.log().is_empty(),
+        "started too early: {:?}",
+        sandbox.log()
+    );
 
-    let mut session = open("greet,bye");
-    session.handshake();
+    assert_eq!(client.call("echo").await.unwrap(), "called echo");
     assert_eq!(
-        prompt_count(session.request(2, "prompts/list", json!({}))),
-        1
+        sandbox.log()[1..],
+        ["tools/call"],
+        "no handshake before the call"
     );
-    session.call(3, "echo");
-    session.wait_for_notification("notifications/prompts/list_changed");
-    assert_eq!(
-        prompt_count(session.request(4, "prompts/list", json!({}))),
-        2
-    );
-    session.close();
+    client.close().await;
 }
 
-#[test]
-fn per_dir_keeps_one_cache_per_working_folder() {
-    let sandbox = Sandbox::new("per-dir");
-    let (first, second) = (sandbox.dir.join("first"), sandbox.dir.join("second"));
+#[tokio::test]
+async fn a_modern_server_without_ttl_is_asked_every_time() {
+    let sandbox = Sandbox::new();
+    sandbox.fill_cache(Protocol::Modern, &[]).await;
+    let client = sandbox.connect(Protocol::Modern, &[], &[]).await;
+
+    assert_eq!(client.tool_names().await, ["echo"]);
+    assert!(
+        sandbox.log().contains(&"tools/list".to_owned()),
+        "a ttlMs of 0 is never served from the cache"
+    );
+    client.close().await;
+}
+
+#[tokio::test]
+async fn a_crashing_server_fails_the_call_and_restarts_on_the_next() {
+    let sandbox = Sandbox::new();
+    let tools = [("FAKE_SERVER_TOOLS", "echo,crash")];
+    sandbox.fill_cache(Protocol::Legacy, &tools).await;
+    let client = sandbox.connect(Protocol::Legacy, &[], &tools).await;
+
+    assert!(client.call("crash").await.is_err());
+    assert_eq!(client.call("echo").await.unwrap(), "called echo");
+    assert_eq!(sandbox.started_pids().len(), 2);
+    client.close().await;
+}
+
+#[tokio::test]
+async fn a_missing_server_fails_the_handshake() {
+    let sandbox = Sandbox::new();
+    let missing = Path::new("/nonexistent/mcp-server");
+    let result = sandbox
+        .try_connect(Protocol::Legacy, &[], &[], sandbox.dir.path(), missing)
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn per_dir_keeps_one_cache_per_working_folder() {
+    let sandbox = Sandbox::new();
+    let (first, second) = (
+        sandbox.dir.path().join("first"),
+        sandbox.dir.path().join("second"),
+    );
     fs::create_dir_all(&first).unwrap();
     fs::create_dir_all(&second).unwrap();
-    let handshake_in = |dir: &Path| {
-        let mut session = sandbox.launch(&["--per-dir"], &fake_server(), &[], dir);
-        session.handshake();
-        session.close();
+    let starts_after_handshake_in = async |dir: &Path| {
+        let client = sandbox
+            .try_connect(Protocol::Legacy, &["--per-dir"], &[], dir, fake_server())
+            .await
+            .unwrap();
+        client.close().await;
         sandbox.started_pids().len()
     };
 
-    assert_eq!(handshake_in(&first), 1, "the first folder fills its cache");
-    assert_eq!(handshake_in(&first), 1, "the first folder is cached");
     assert_eq!(
-        handshake_in(&second),
+        starts_after_handshake_in(&first).await,
+        1,
+        "the first folder fills its cache"
+    );
+    assert_eq!(
+        starts_after_handshake_in(&first).await,
+        1,
+        "the first folder is cached"
+    );
+    assert_eq!(
+        starts_after_handshake_in(&second).await,
         2,
         "the second folder has its own cache"
     );
 }
 
-#[test]
-fn a_crashing_server_fails_the_request_and_restarts_on_the_next_call() {
-    let sandbox = Sandbox::new("crash");
-    sandbox.fill_cache("echo,crash");
-    let mut session = sandbox.session(600, "echo,crash");
-    session.handshake();
+#[tokio::test]
+async fn a_terminate_signal_stops_the_server_with_mcp_nap() {
+    let sandbox = Sandbox::new();
+    sandbox.fill_cache(Protocol::Legacy, &[]).await;
+    let client = sandbox.connect(Protocol::Legacy, &[], &[]).await;
+    client.call("echo").await.unwrap();
+    let server = sandbox.started_pids()[0];
 
-    assert_eq!(session.call(2, "crash")["error"]["code"], -32603);
-    assert_eq!(text(&session.call(3, "echo")), "called echo");
-    assert_eq!(sandbox.started_pids().len(), 2);
-    session.close();
-}
-
-#[test]
-fn a_missing_server_fails_the_handshake() {
-    let sandbox = Sandbox::new("missing");
-    let mut session = sandbox.launch(&[], Path::new("/nonexistent/mcp-server"), &[], &sandbox.dir);
-
-    assert_eq!(session.handshake()["error"]["code"], -32603);
-    session.close();
+    std::process::Command::new("kill")
+        .arg(client.mcp_nap.to_string())
+        .status()
+        .unwrap();
+    assert!(
+        wait_until(|| !is_running(server)).await,
+        "the server outlived a terminated mcp-nap"
+    );
+    client.close().await;
 }
