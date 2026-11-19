@@ -83,7 +83,7 @@ Options end at the first argument without a dash, like with `timeout` or `env`, 
 - `initialize`, `ping` and the tool, prompt and resource lists are answered from a cache.
 - Any other request, such as a tool call, starts the server, replays the client's `initialize`, then forwards the request.
 - After the idle time with nothing in flight, the server's whole process group is stopped, so launchers like `npx` and `uvx` go with their children. The next call starts it again.
-- When a fresh server lists different tools than the cache, the client gets `notifications/tools/list_changed`.
+- When a fresh server lists different tools, prompts or resources than the cache, the cache is updated and the client gets the matching `list_changed` notification.
 - The first session for a command starts the server once to fill the cache.
 
 ## Limits

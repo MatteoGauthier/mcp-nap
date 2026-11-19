@@ -23,16 +23,18 @@ pub enum Event {
     ServerClosed(u64),
 }
 
-/// Requests answered from the cache while the server sleeps.
-const LIST_METHODS: [&str; 4] = [
-    "tools/list",
-    "prompts/list",
-    "resources/list",
-    "resources/templates/list",
+/// Lists answered from the cache while the server sleeps, each with the notification that marks it changed.
+const LISTS: [(&str, &str); 4] = [
+    ("tools/list", "notifications/tools/list_changed"),
+    ("prompts/list", "notifications/prompts/list_changed"),
+    ("resources/list", "notifications/resources/list_changed"),
+    (
+        "resources/templates/list",
+        "notifications/resources/list_changed",
+    ),
 ];
 
 const INITIALIZED: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
-const TOOLS_CHANGED: &str = r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
 
 pub fn run(config: Config) {
     let (events, inbox) = mpsc::channel();
@@ -59,7 +61,8 @@ enum Pending {
 
 enum Internal {
     Initialize,
-    RefreshTools,
+    /// re-reads a cached list after a start, holding the list and its change notification
+    Refresh(&'static str, &'static str),
 }
 
 struct Proxy {
@@ -196,8 +199,8 @@ impl Proxy {
                 if method == "resources/subscribe" {
                     self.subscribed = true;
                 }
-                let cacheable =
-                    LIST_METHODS.contains(&method) && message.pointer("/params/cursor").is_none();
+                let cacheable = LISTS.iter().any(|(list, _)| *list == method)
+                    && message.pointer("/params/cursor").is_none();
                 if cacheable && self.server.is_none() {
                     if let Some(result) = self.cache.get(method).cloned() {
                         return self.reply(&id, result);
@@ -250,16 +253,10 @@ impl Proxy {
     }
 
     fn forget_changed_lists(&mut self, method: &str) {
-        let stale: &[&str] = match method {
-            "notifications/tools/list_changed" => &["tools/list"],
-            "notifications/prompts/list_changed" => &["prompts/list"],
-            "notifications/resources/list_changed" => {
-                &["resources/list", "resources/templates/list"]
+        for (list, notification) in LISTS {
+            if notification == method {
+                self.cache.remove(list);
             }
-            _ => &[],
-        };
-        for key in stale {
-            self.cache.remove(key);
         }
     }
 
@@ -279,20 +276,25 @@ impl Proxy {
                 while let Some(line) = self.queue.pop_front() {
                     self.send(&line);
                 }
-                if self.cache.get("tools/list").is_some() {
-                    let id = self.internal_request(Internal::RefreshTools);
-                    self.send(
-                        &json!({ "jsonrpc": "2.0", "id": id, "method": "tools/list" }).to_string(),
+                // lists the client got from the cache are checked against the running server
+                for (list, notification) in LISTS {
+                    if self.cache.get(list).is_some() {
+                        let id = self.internal_request(Internal::Refresh(list, notification));
+                        self.send(
+                            &json!({ "jsonrpc": "2.0", "id": id, "method": list }).to_string(),
+                        );
+                    }
+                }
+            }
+            (Internal::Refresh(list, notification), Some(result)) => {
+                if self.cache.get(list) != Some(result) {
+                    self.cache.set(list, result.clone());
+                    self.write_client(
+                        &json!({ "jsonrpc": "2.0", "method": notification }).to_string(),
                     );
                 }
             }
-            (Internal::RefreshTools, Some(result)) => {
-                if self.cache.get("tools/list") != Some(result) {
-                    self.cache.set("tools/list", result.clone());
-                    self.write_client(TOOLS_CHANGED);
-                }
-            }
-            (Internal::RefreshTools, None) => {}
+            (Internal::Refresh(..), None) => {}
         }
     }
 

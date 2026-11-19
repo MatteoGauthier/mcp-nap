@@ -282,6 +282,39 @@ fn changed_tools_are_announced_after_a_start() {
 }
 
 #[test]
+fn changed_prompts_are_announced_after_a_start() {
+    let sandbox = Sandbox::new("prompts");
+    let open = |prompts: &str| {
+        sandbox.launch(
+            &[],
+            &fake_server(),
+            &[("FAKE_SERVER_PROMPTS", prompts)],
+            &sandbox.dir,
+        )
+    };
+    let prompt_count = |response: Value| response["result"]["prompts"].as_array().unwrap().len();
+
+    let mut session = open("greet");
+    session.handshake();
+    session.request(2, "prompts/list", json!({}));
+    session.close();
+
+    let mut session = open("greet,bye");
+    session.handshake();
+    assert_eq!(
+        prompt_count(session.request(2, "prompts/list", json!({}))),
+        1
+    );
+    session.call(3, "echo");
+    session.wait_for_notification("notifications/prompts/list_changed");
+    assert_eq!(
+        prompt_count(session.request(4, "prompts/list", json!({}))),
+        2
+    );
+    session.close();
+}
+
+#[test]
 fn a_crashing_server_fails_the_request_and_restarts_on_the_next_call() {
     let sandbox = Sandbox::new("crash");
     sandbox.fill_cache("echo,crash");
