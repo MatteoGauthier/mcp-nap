@@ -16,23 +16,23 @@ Chrome DevTools MCP on an Apple Silicon Mac:
 | Next tool calls | ~2 ms | ~2 ms |
 | After 10 idle minutes | still running | stopped |
 
-## Agent setup
+## Getting started
 
-Paste this into your coding agent:
+The quickest way: paste this into your coding agent.
 
 > Install mcp-nap with `cargo install --git https://github.com/MatteoGauthier/mcp-nap`, then for each local stdio MCP server configured in my coding agents and editors, propose putting the full path of `mcp-nap` before its command, show me the diff with secrets masked, and write the files only after I approve.
 
-## Install
+### Install
 
 ```sh
 cargo install --git https://github.com/MatteoGauthier/mcp-nap
 ```
 
-This puts `mcp-nap` in `~/.cargo/bin`. It needs Rust 1.88 or later, and runs on macOS and Linux only. From a clone, use `cargo install --path .`.
+This puts `mcp-nap` in `~/.cargo/bin`. It needs Rust 1.88 or later. It runs on macOS and Linux, and builds for Windows, where it has not been run yet. From a clone, use `cargo install --path .`.
 
-## Use
+### Configure coding agents
 
-Write `mcp-nap` before the command of a stdio server.
+Write `mcp-nap` before the command of each local stdio MCP server.
 
 <details>
 <summary>Claude Code</summary>
@@ -89,13 +89,52 @@ args = ["chrome-devtools-mcp", "--browser-url=http://127.0.0.1:9222"]
 
 If an app does not find `mcp-nap`, use the full path, for example `/Users/you/.cargo/bin/mcp-nap`. Environment variables set on the server entry reach the real server unchanged.
 
-## Options
+## Help
 
-- `--idle <seconds>`: idle time before the server is stopped, `0` keeps it running. Default `600`.
-- `--cache-dir <dir>`: where results are cached. Default `~/Library/Caches/mcp-nap` on macOS, `$XDG_CACHE_HOME/mcp-nap` or `~/.cache/mcp-nap` on Linux.
-- `--per-dir`: keep a separate cache per working folder, for servers whose tools, prompts or resources depend on the project they run in. Off by default, so a new folder reuses the cache of the same command.
+```console
+$ mcp-nap --help
+Keeps a stdio MCP server asleep until a tool is called.
 
-Options end at the first argument without a dash, like with `timeout` or `env`, so the server's own flags pass through untouched. Write `--` before the command only if it starts with a dash.
+Answers the handshake and the tool, prompt and resource lists from a cache, starts SERVER on the first other request, and stops it after the idle time.
+
+Usage: mcp-nap [OPTIONS] <SERVER>...
+       mcp-nap cache <list|clear> [OPTIONS] [SERVER]...
+
+Commands:
+  cache  Show or clear cached results
+
+Arguments:
+  <SERVER>...
+          The server command and its arguments, passed through untouched.
+
+          Options end at the first argument without a dash, so the server's own flags are left alone. Write -- before a server that starts with a dash or is named cache.
+
+Options:
+      --idle <SECONDS>
+          Seconds without activity before the server is stopped, 0 keeps it running
+
+          [default: 600]
+
+      --cache-dir <DIR>
+          Where cached results are kept.
+
+          [default: ~/Library/Caches/mcp-nap on macOS, $XDG_CACHE_HOME/mcp-nap or ~/.cache/mcp-nap on Linux, %LOCALAPPDATA%\mcp-nap on Windows]
+
+      --per-dir
+          Keep a separate cache per working folder, for servers whose tools, prompts or resources depend on the project they run in.
+
+  -q, --quiet
+          Log errors only
+
+  -v, --verbose
+          Also log each request answered from the cache or forwarded to the server
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+```
 
 ## How it works
 
@@ -105,7 +144,7 @@ mcp-nap speaks both MCP protocol eras, through the official Rust SDK [rmcp](http
 - **2025-11-25 and earlier**: `initialize`, `ping`, `logging/setLevel` and the lists are answered from the cache. A start replays the client's `initialize` and log level first. These results carry no cache hints, so they stay until a fresh server lists something else, which the client then hears as a `list_changed` notification.
 - Any other request, such as a tool call, starts the server and is forwarded unchanged.
 - The server stops after the idle time with nothing in flight: no pending request, no running task, no open subscription.
-- Stopping follows the MCP stdio shutdown: close stdin, then `SIGTERM`, then `SIGKILL`, to the server's whole process group, so launchers like `npx` and `uvx` go with their children. mcp-nap does the same when its client stops it.
+- Stopping follows the MCP stdio shutdown: close stdin, then `SIGTERM`, then `SIGKILL`, to the server's whole process group, so launchers like `npx` and `uvx` go with their children. On Windows the server runs in a job object, which is closed after stdin. mcp-nap does the same when its client stops it.
 - The first session for a command starts the server once to fill the cache.
 
 ## Limits
@@ -124,7 +163,7 @@ The unit tests cover the protocol rules in `src/session.rs` without processes. T
 
 ## Todo
 
-- [ ] CI: a GitHub Actions workflow running `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test` on macOS and Linux.
+- [ ] CI: a GitHub Actions workflow running `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test` on macOS, Linux and Windows.
 - [ ] Release binaries, for example with `cargo-dist`, so mcp-nap installs without a Rust toolchain.
 - [ ] Publish to crates.io, so `cargo install mcp-nap` works.
 
