@@ -104,6 +104,12 @@ cargo test
 
 The unit tests cover the protocol rules in `src/session.rs` without processes. The integration tests drive the binary with the rmcp client, on both protocol eras, against `examples/fake_server.rs`, an rmcp server that logs what it handles.
 
+## Todo
+
+- [ ] CI: a GitHub Actions workflow running `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test` on macOS and Linux.
+- [ ] Release binaries, for example with `cargo-dist`, so mcp-nap installs without a Rust toolchain.
+- [ ] Publish to crates.io, so `cargo install mcp-nap` works.
+
 ## License
 
 MIT
