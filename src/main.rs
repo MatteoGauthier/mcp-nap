@@ -82,3 +82,55 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         cache_dir: cache_dir.unwrap_or_else(cache::default_dir),
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Command, String> {
+        parse_args(args.iter().map(|arg| arg.to_string()).collect())
+    }
+
+    fn run(args: &[&str]) -> Config {
+        let Ok(Command::Run(config)) = parse(args) else {
+            panic!("expected a run command for {args:?}");
+        };
+        config
+    }
+
+    #[test]
+    fn options_end_at_the_server_command() {
+        let config = run(&[
+            "--idle",
+            "30",
+            "--cache-dir",
+            "/tmp/nap",
+            "npx",
+            "-y",
+            "server",
+            "--idle",
+            "5",
+        ]);
+        assert_eq!(config.idle, Duration::from_secs(30));
+        assert_eq!(config.cache_dir, PathBuf::from("/tmp/nap"));
+        assert_eq!(config.command, ["npx", "-y", "server", "--idle", "5"]);
+    }
+
+    #[test]
+    fn accepts_a_double_dash_before_the_command() {
+        assert_eq!(run(&["--idle", "30", "--", "-server"]).command, ["-server"]);
+    }
+
+    #[test]
+    fn defaults_to_ten_idle_minutes() {
+        assert_eq!(run(&["server"]).idle, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn rejects_bad_input() {
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["--"]).is_err());
+        assert!(parse(&["--idle", "soon", "server"]).is_err());
+        assert!(parse(&["--verbose", "server"]).is_err());
+    }
+}
