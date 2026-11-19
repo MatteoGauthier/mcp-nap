@@ -1,141 +1,99 @@
 mod cache;
 mod proxy;
 mod server;
+mod session;
 
-use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use proxy::Config;
+use clap::Parser;
 
-const USAGE: &str = "\
-usage: mcp-nap [--idle <seconds>] [--cache-dir <dir>] [--per-dir] <command> [args...]
+/// Keeps a stdio MCP server asleep until a tool is called.
+///
+/// Answers the handshake and the tool, prompt and resource lists from a cache,
+/// starts COMMAND on the first other request, and stops it after the idle time.
+#[derive(Debug, Parser)]
+#[command(version)]
+struct Cli {
+    /// Seconds without activity before the server is stopped, 0 keeps it running
+    #[arg(long, value_name = "SECONDS", default_value_t = 600)]
+    idle: u64,
 
-Starts <command> on the first tool call and stops it after <seconds> idle.
+    /// Where cached results are kept [default: the platform cache folder]
+    #[arg(long, value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
 
-options:
-  --idle <seconds>   idle time before the server is stopped, 0 = never (default 600)
-  --cache-dir <dir>  where handshake and list responses are cached
-  --per-dir          keep a separate cache per working folder
-  -h, --help         print this help
-  -V, --version      print the version";
+    /// Keep a separate cache per working folder
+    #[arg(long)]
+    per_dir: bool,
 
-enum Command {
-    Run(Config),
-    Help,
-    Version,
+    /// The server command and its arguments, passed through untouched
+    #[arg(value_name = "COMMAND", required = true, trailing_var_arg = true)]
+    command: Vec<String>,
 }
 
-fn main() -> ExitCode {
-    match parse_args(env::args().skip(1).collect()) {
-        Ok(Command::Run(config)) => {
-            proxy::run(config);
-            ExitCode::SUCCESS
-        }
-        Ok(Command::Help) => {
-            println!("{USAGE}");
-            ExitCode::SUCCESS
-        }
-        Ok(Command::Version) => {
-            println!("mcp-nap {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
-        }
-        Err(message) => {
-            eprintln!("mcp-nap: {message}\n\n{USAGE}");
-            ExitCode::from(2)
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let config = proxy::Config {
+        command: cli.command,
+        idle: Duration::from_secs(cli.idle),
+        cache_dir: cli.cache_dir.unwrap_or_else(cache::default_dir),
+        per_dir: cli.per_dir,
+    };
+    match proxy::run(config).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("mcp-nap: {error}");
+            ExitCode::FAILURE
         }
     }
-}
-
-fn parse_args(args: Vec<String>) -> Result<Command, String> {
-    let mut idle = Duration::from_secs(600);
-    let mut cache_dir = None;
-    let mut per_dir = false;
-    let mut args = args.into_iter().peekable();
-    // like `timeout` or `env`: options end at the first argument without a dash, or at `--`
-    while let Some(arg) = args.next_if(|arg| arg.starts_with('-')) {
-        match arg.as_str() {
-            "--" => break,
-            "--idle" => {
-                let value = args.next().ok_or("--idle needs a value")?;
-                let seconds = value
-                    .parse()
-                    .map_err(|_| format!("invalid --idle value: {value}"))?;
-                idle = Duration::from_secs(seconds);
-            }
-            "--cache-dir" => {
-                cache_dir = Some(PathBuf::from(
-                    args.next().ok_or("--cache-dir needs a value")?,
-                ));
-            }
-            "--per-dir" => per_dir = true,
-            "-h" | "--help" => return Ok(Command::Help),
-            "-V" | "--version" => return Ok(Command::Version),
-            other => return Err(format!("unknown option: {other}")),
-        }
-    }
-    let command: Vec<String> = args.collect();
-    if command.is_empty() {
-        return Err("missing server command".into());
-    }
-    Ok(Command::Run(Config {
-        command,
-        idle,
-        cache_dir: cache_dir.unwrap_or_else(cache::default_dir),
-        per_dir,
-    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
-    fn parse(args: &[&str]) -> Result<Command, String> {
-        parse_args(args.iter().map(|arg| arg.to_string()).collect())
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(["mcp-nap"].iter().chain(args))
     }
 
-    fn run(args: &[&str]) -> Config {
-        let Ok(Command::Run(config)) = parse(args) else {
-            panic!("expected a run command for {args:?}");
-        };
-        config
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
     }
 
     #[test]
     fn options_end_at_the_server_command() {
-        let config = run(&[
+        let cli = parse(&[
             "--idle",
             "30",
-            "--cache-dir",
-            "/tmp/nap",
+            "--per-dir",
             "npx",
             "-y",
             "server",
             "--idle",
             "5",
-        ]);
-        assert_eq!(config.idle, Duration::from_secs(30));
-        assert_eq!(config.cache_dir, PathBuf::from("/tmp/nap"));
-        assert_eq!(config.command, ["npx", "-y", "server", "--idle", "5"]);
+        ])
+        .unwrap();
+        assert_eq!(cli.idle, 30);
+        assert!(cli.per_dir);
+        assert_eq!(cli.command, ["npx", "-y", "server", "--idle", "5"]);
     }
 
     #[test]
-    fn accepts_a_double_dash_before_the_command() {
-        assert_eq!(run(&["--idle", "30", "--", "-server"]).command, ["-server"]);
+    fn a_double_dash_allows_a_command_starting_with_a_dash() {
+        assert_eq!(parse(&["--", "-server"]).unwrap().command, ["-server"]);
     }
 
     #[test]
     fn defaults_to_ten_idle_minutes_and_one_cache_per_command() {
-        let config = run(&["server"]);
-        assert_eq!(config.idle, Duration::from_secs(600));
-        assert!(!config.per_dir);
-    }
-
-    #[test]
-    fn per_dir_turns_on_a_cache_per_working_folder() {
-        assert!(run(&["--per-dir", "server"]).per_dir);
-        assert!(!run(&["server", "--per-dir"]).per_dir);
+        let cli = parse(&["server"]).unwrap();
+        assert_eq!(cli.idle, 600);
+        assert!(!cli.per_dir);
+        assert_eq!(cli.cache_dir, None);
     }
 
     #[test]
